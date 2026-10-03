@@ -225,6 +225,92 @@ def archive_cues(row: sqlite3.Row) -> list[tuple[str, str]]:
     ]
 
 
+# ---------------------------------------------------------------- 场次对照
+
+MISSING_SIDE = {"status": "missing", "content": None, "offset_seconds": None}
+
+
+def parse_time(iso_text: Optional[str]) -> Optional[datetime]:
+    if not iso_text:
+        return None
+    return datetime.fromisoformat(iso_text.replace("Z", "+00:00"))
+
+
+def archive_side_view(row: sqlite3.Row) -> dict[str, dict]:
+    """档案 -> {编号: 一侧视图}：已发给内容快照与相对零点秒数，未发给内容。
+
+    零点为该场首条已发提示的发出时间；相对秒数保留毫秒，暂停时长不扣除、
+    直接计入时间差。未发条目、或已发但缺发出时间的条目秒数为 None。
+    """
+    view: dict[str, dict] = {}
+    issued = json.loads(row["issued"])
+    zero = parse_time(issued[0].get("issued_at")) if issued else None
+    for cue in issued:
+        at = parse_time(cue.get("issued_at"))
+        offset = None
+        if zero is not None and at is not None:
+            offset = round((at - zero).total_seconds(), 3)
+        view[cue["number"]] = {
+            "status": "issued",
+            "content": cue["content"],
+            "offset_seconds": offset,
+        }
+    for cue in json.loads(row["pending"]):
+        view[cue["number"]] = {
+            "status": "pending",
+            "content": cue["content"],
+            "offset_seconds": None,
+        }
+    return view
+
+
+def compare_rows(base_view: dict[str, dict], compare_view: dict[str, dict]) -> list[dict]:
+    """按编号精确匹配取并集（编号字符串升序），逐条给出两侧状态与秒数差。
+
+    仅两侧均已发出且内容完全相同时计算"对照减基准"的秒数差（正值表示
+    对照场更晚），其余为 None 并附中文原因。
+    """
+    rows = []
+    for number in sorted(set(base_view) | set(compare_view)):
+        base = base_view.get(number)
+        comp = compare_view.get(number)
+        delta = None
+        reason = None
+        if (
+            base is not None
+            and comp is not None
+            and base["status"] == "issued"
+            and comp["status"] == "issued"
+        ):
+            if base["content"] != comp["content"]:
+                reason = "两侧均已发出，但内容不一致"
+            elif base["offset_seconds"] is None or comp["offset_seconds"] is None:
+                reason = "缺少发出时间，无法计算秒数差"
+            else:
+                delta = round(comp["offset_seconds"] - base["offset_seconds"], 3)
+        else:
+            parts = []
+            if base is None:
+                parts.append("基准场无此编号")
+            elif base["status"] != "issued":
+                parts.append("基准场未发出")
+            if comp is None:
+                parts.append("对照场无此编号")
+            elif comp["status"] != "issued":
+                parts.append("对照场未发出")
+            reason = "；".join(parts)
+        rows.append(
+            {
+                "number": number,
+                "base": base if base is not None else dict(MISSING_SIDE),
+                "compare": comp if comp is not None else dict(MISSING_SIDE),
+                "delta_seconds": delta,
+                "delta_reason": reason,
+            }
+        )
+    return rows
+
+
 # ---------------------------------------------------------------- 应用
 
 @asynccontextmanager
@@ -300,6 +386,38 @@ def get_archive(archive_id: int):
         if row is None:
             return JSONResponse(status_code=404, content={"error": "archive_not_found"})
         return archive_detail(row)
+
+
+@app.get("/api/compare")
+def compare_archives(base: int, compare: int):
+    """对照两场档案的提示发出节奏（只读，任意演出状态可用）。
+
+    按编号精确匹配取两场提示的并集，按编号字符串升序返回；每条列出两侧
+    内容快照、已发/未发/缺失状态与相对发出秒数。各场以首条已发提示的
+    发出时间为零点，使用档案保存的发出时间，保留小数秒，暂停时长计入；
+    未发、缺失或整场无已发记录时秒数为 null。仅两侧均已发出且内容完全
+    相同时计算"对照减基准"的秒数差（正值表示对照场更晚），其余为 null
+    并附中文原因。任一档案不存在返回 404。查询不修改档案、当前演出或
+    版本号。
+    """
+    with db() as conn:
+        sides = {}
+        for key, archive_id in (("base", base), ("compare", compare)):
+            row = conn.execute(
+                "SELECT * FROM archives WHERE id = ?", (archive_id,)
+            ).fetchone()
+            if row is None:
+                return JSONResponse(
+                    status_code=404, content={"error": "archive_not_found"}
+                )
+            sides[key] = row
+
+    views = {key: archive_side_view(row) for key, row in sides.items()}
+    return {
+        "base": archive_summary(sides["base"]),
+        "compare": archive_summary(sides["compare"]),
+        "rows": compare_rows(views["base"], views["compare"]),
+    }
 
 
 @app.post("/api/setup")

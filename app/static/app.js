@@ -107,6 +107,7 @@ async function apiGetJson(path) {
 
 async function loadArchiveList() {
   currentDetail = null;
+  compareSeq++; // 离开对照视图（若曾在），作废可能在途的对照响应
   $("#archives-title").textContent = "📚 档案库";
   $("#archives-body").innerHTML = `<p class="empty">加载中…</p>`;
   let data;
@@ -125,7 +126,10 @@ async function loadArchiveList() {
     return;
   }
   $("#archives-body").innerHTML = `
-    ${canArchive ? `<div class="actions"><button class="primary" data-action="archive-form">归档当前场次 🗂</button></div>` : ""}
+    <div class="actions">
+      ${canArchive ? `<button class="primary" data-action="archive-form">归档当前场次 🗂</button>` : ""}
+      <button data-action="compare-view">场次对照 ⇄</button>
+    </div>
     <ul class="archive-list">
       ${items.map((a) => `
         <li class="archive-item" data-action="archive-detail" data-id="${a.id}" tabindex="0">
@@ -309,6 +313,148 @@ async function submitStartFromArchive() {
   } finally {
     startSubmitting = false;
   }
+}
+
+/* ---------------------------------------------------------------- 场次对照 */
+
+let compareSeq = 0; // 对照请求序号：切换场次即作废旧响应，防止旧结果覆盖新选择
+
+const COMPARE_STATUS = {
+  issued: { label: "已发", cls: "issued" },
+  pending: { label: "未发", cls: "pending" },
+  missing: { label: "缺失", cls: "missing" },
+};
+
+function fmtSeconds(s, signed) {
+  if (s === null || s === undefined) return "—";
+  const v = Number(s).toFixed(3);
+  return signed && s > 0 ? `+${v} s` : `${v} s`;
+}
+
+async function openCompareView() {
+  compareSeq++; // 离开旧对照，作废可能在途的响应
+  $("#archives-title").textContent = "场次对照";
+  $("#archives-body").innerHTML = `<p class="empty">加载中…</p>`;
+  let data;
+  try {
+    data = await apiGetJson("/api/archives");
+  } catch (err) {
+    $("#archives-body").innerHTML = `
+      <p class="empty">档案加载失败：${escapeHtml(err.message)}</p>
+      <div class="actions"><button data-action="archive-list">← 返回列表</button></div>`;
+    return;
+  }
+  const items = data.archives || [];
+  if (!items.length) {
+    $("#archives-body").innerHTML = `
+      <p class="empty">还没有归档档案，无法对照。演出结束或提前收场后，可先「归档本场」保存档案。</p>
+      <div class="actions"><button data-action="archive-list">← 返回列表</button></div>`;
+    return;
+  }
+  const optionsHtml = items.map((a) =>
+    `<option value="${a.id}">#${a.id} ${escapeHtml(a.name)}（${statusLabel(a.status)} · ${fmtTime(a.archived_at)}）</option>`
+  ).join("");
+  $("#archives-body").innerHTML = `
+    <p class="hint">按编号精确匹配两场提示，各场以<b>首条已发</b>提示的发出时间为零点比较节奏（暂停时长计入）。仅两侧均已发出且内容完全一致的编号才计算「对照 − 基准」秒数差，<b>正值表示对照场更晚</b>。</p>
+    <div class="compare-selects">
+      <div class="compare-field">
+        <label for="compare-base">基准场次</label>
+        <select id="compare-base">${optionsHtml}</select>
+      </div>
+      <div class="compare-field">
+        <label for="compare-compare">对照场次</label>
+        <select id="compare-compare">${optionsHtml}</select>
+      </div>
+    </div>
+    <div id="compare-result"></div>
+    <div class="actions"><button data-action="archive-list">← 返回列表</button></div>`;
+  // 默认：基准选较早一场、对照选最新一场，便于直接看到差异
+  $("#compare-compare").value = String(items[0].id);
+  $("#compare-base").value = String(items.length > 1 ? items[1].id : items[0].id);
+  compareSelectionChanged();
+}
+
+function compareSelectionChanged() {
+  const baseId = $("#compare-base").value;
+  const compareId = $("#compare-compare").value;
+  if (!baseId || !compareId) {
+    compareSeq++; // 作废旧响应并清空旧结果，避免残留
+    $("#compare-result").innerHTML = `<p class="hint">请选择基准场次与对照场次。</p>`;
+    return;
+  }
+  runCompare(Number(baseId), Number(compareId));
+}
+
+async function runCompare(baseId, compareId) {
+  const seq = ++compareSeq; // 新请求作废旧请求；响应回来时序号不符即丢弃
+  const result = $("#compare-result");
+  result.innerHTML = `<p class="empty">对照中…</p>`;
+  let res, data;
+  try {
+    res = await fetch(
+      `/api/compare?base=${encodeURIComponent(baseId)}&compare=${encodeURIComponent(compareId)}`
+    );
+    data = await res.json();
+  } catch (err) {
+    if (seq !== compareSeq) return;
+    result.innerHTML = `<p class="empty">对照失败：${escapeHtml(err.message)}</p>`;
+    return;
+  }
+  if (seq !== compareSeq) return; // 场次已切换，不用旧响应覆盖新结果
+  if (res.status === 404) {
+    result.innerHTML = `<p class="empty">档案不存在，可能已被删除，请返回列表刷新。</p>`;
+    return;
+  }
+  if (!res.ok) {
+    result.innerHTML = `<p class="empty">对照失败：${escapeHtml(data.error || "请求失败")}</p>`;
+    return;
+  }
+  renderCompareResult(data);
+}
+
+function compareSideHtml(side) {
+  const meta = COMPARE_STATUS[side.status] || COMPARE_STATUS.missing;
+  const content = side.content === null || side.content === undefined
+    ? "—" : escapeHtml(side.content);
+  const offset = side.offset_seconds === null || side.offset_seconds === undefined
+    ? "" : `<div class="compare-offset">零点 +${fmtSeconds(side.offset_seconds)}</div>`;
+  return `<span class="tag ${meta.cls}">${meta.label}</span>
+    <div class="content">${content}</div>${offset}`;
+}
+
+function renderCompareResult(data) {
+  const result = $("#compare-result");
+  if (!result) return; // 已离开对照视图，丢弃结果
+  const rows = data.rows || [];
+  const comparable = rows.filter((r) => r.delta_seconds !== null).length;
+  const emptyHint = comparable === 0
+    ? `<p class="hint compare-no-match">⚠ 两场没有可对照的提示：需同一编号在两侧均已发出且内容完全一致，才能计算秒数差。</p>`
+    : "";
+  result.innerHTML = `
+    ${emptyHint}
+    <div class="compare-head">
+      <span>编号</span>
+      <span>基准 · ${escapeHtml(data.base.name)}</span>
+      <span>对照 · ${escapeHtml(data.compare.name)}</span>
+      <span>对照 − 基准</span>
+    </div>
+    ${rows.map((r) => {
+      let deltaHtml;
+      if (r.delta_seconds !== null) {
+        const cls = r.delta_seconds > 0 ? "later" : r.delta_seconds < 0 ? "earlier" : "same";
+        deltaHtml = `<span class="compare-delta ${cls}">${fmtSeconds(r.delta_seconds, true)}</span>`;
+      } else {
+        deltaHtml = `<span class="compare-delta na">—</span>
+          <div class="compare-reason">${escapeHtml(r.delta_reason || "")}</div>`;
+      }
+      return `<div class="compare-row">
+        <span class="badge">${escapeHtml(r.number)}</span>
+        <div class="compare-side">${compareSideHtml(r.base)}</div>
+        <div class="compare-side">${compareSideHtml(r.compare)}</div>
+        <div class="compare-delta-cell">${deltaHtml}</div>
+      </div>`;
+    }).join("")}
+    <p class="hint">零点为各场首条已发提示的发出时间；秒数保留毫秒，暂停时长计入。共 ${rows.length} 个编号，其中 ${comparable} 条可对照。</p>`;
 }
 
 /* ---------------------------------------------------------------- 渲染 */
@@ -541,6 +687,14 @@ $("#archives-body").addEventListener("click", (e) => {
     loadArchiveDetail(Number(btn.dataset.id));
   } else if (action === "start-from-archive") {
     submitStartFromArchive();
+  } else if (action === "compare-view") {
+    openCompareView();
+  }
+});
+
+$("#archives-body").addEventListener("change", (e) => {
+  if (e.target.id === "compare-base" || e.target.id === "compare-compare") {
+    compareSelectionChanged();
   }
 });
 
