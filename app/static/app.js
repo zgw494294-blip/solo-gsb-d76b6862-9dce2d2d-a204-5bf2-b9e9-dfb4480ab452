@@ -81,6 +81,7 @@ function updateBusy() {
 let archiveSubmitting = false; // 归档请求在途，禁用提交防止重复建档案
 let currentDetail = null;      // 当前查看的档案详情（"以此开新场"使用）
 let startSubmitting = false;   // 以此开新场请求在途，禁用提交防重复
+let compareSeq = 0;            // 对照请求序号：发起/切换场次/离开视图时 +1，旧响应直接丢弃
 
 function statusLabel(status) {
   return status === "done" ? "已完成" : "提前收场";
@@ -96,6 +97,7 @@ function openArchivesModal() {
 }
 
 function closeArchivesModal() {
+  compareSeq++; // 关闭弹窗后，在途的对照响应不得再写入
   $("#archives-modal").classList.add("hidden");
 }
 
@@ -106,6 +108,7 @@ async function apiGetJson(path) {
 }
 
 async function loadArchiveList() {
+  compareSeq++; // 离开对照视图：在途对照响应一律丢弃
   currentDetail = null;
   $("#archives-title").textContent = "📚 档案库";
   $("#archives-body").innerHTML = `<p class="empty">加载中…</p>`;
@@ -125,7 +128,10 @@ async function loadArchiveList() {
     return;
   }
   $("#archives-body").innerHTML = `
-    ${canArchive ? `<div class="actions"><button class="primary" data-action="archive-form">归档当前场次 🗂</button></div>` : ""}
+    <div class="actions">
+      ${canArchive ? `<button class="primary" data-action="archive-form">归档当前场次 🗂</button>` : ""}
+      <button data-action="compare-view">⚖ 场次对照</button>
+    </div>
     <ul class="archive-list">
       ${items.map((a) => `
         <li class="archive-item" data-action="archive-detail" data-id="${a.id}" tabindex="0">
@@ -140,6 +146,7 @@ async function loadArchiveList() {
 }
 
 async function loadArchiveDetail(id) {
+  compareSeq++; // 离开对照视图：在途对照响应一律丢弃
   $("#archives-title").textContent = "档案详情";
   $("#archives-body").innerHTML = `<p class="empty">加载中…</p>`;
   let a;
@@ -204,6 +211,7 @@ function openArchiveForm() {
     toast("开场前没有可归档的场次");
     return;
   }
+  compareSeq++; // 离开对照视图：在途对照响应一律丢弃
   $("#archives-title").textContent = "归档本场";
   $("#archives-body").innerHTML = `
     <p class="hint">归档后本场将保存为独立档案，并清空当前提示、回到开场前设置；之后录入、重置和重启都不会影响档案。</p>
@@ -309,6 +317,151 @@ async function submitStartFromArchive() {
   } finally {
     startSubmitting = false;
   }
+}
+
+/* ---------------------------------------------------------------- 场次对照 */
+
+function fmtSeconds(v) {
+  return v === null || v === undefined ? "—" : v.toFixed(3) + "s";
+}
+
+function fmtDiff(v) {
+  return (v > 0 ? "+" : "") + v.toFixed(3) + "s";
+}
+
+function compareSideCell(side) {
+  if (side.status === "missing") return `<span class="tag miss">缺失</span>`;
+  const issued = side.status === "issued";
+  return `<div class="cmp-side">
+    <span class="tag ${issued ? "done" : "early"}">${issued ? "已发" : "未发"}</span>
+    <span class="time">${fmtSeconds(side.seconds)}</span>
+    <div class="content">${escapeHtml(side.content ?? "")}</div>
+  </div>`;
+}
+
+async function openCompareView() {
+  const seq = ++compareSeq;
+  $("#archives-title").textContent = "⚖ 场次对照";
+  $("#archives-body").innerHTML = `<p class="empty">加载中…</p>`;
+  let data;
+  try {
+    data = await apiGetJson("/api/archives");
+  } catch (err) {
+    if (seq !== compareSeq) return;
+    $("#archives-body").innerHTML = `
+      <p class="empty">档案加载失败：${escapeHtml(err.message)}</p>
+      <div class="actions"><button data-action="archive-list">← 返回列表</button></div>`;
+    return;
+  }
+  if (seq !== compareSeq) return; // 等待期间已离开对照视图
+  const items = data.archives || [];
+  if (!items.length) {
+    $("#archives-body").innerHTML = `
+      <p class="empty">还没有归档档案，无法对照。</p>
+      <div class="actions"><button data-action="archive-list">← 返回列表</button></div>`;
+    return;
+  }
+  const options = items.map((a) =>
+    `<option value="${a.id}">#${a.id} ${escapeHtml(a.name)}（${fmtTime(a.archived_at)}）</option>`
+  ).join("");
+  $("#archives-body").innerHTML = `
+    <p class="hint">选择基准场次与对照场次，按<b>编号</b>逐条对照发出节奏：各场以<b>首条已发提示</b>为零点，秒数含暂停时长；仅两侧均已发且内容完全相同的编号可计算差值（对照 − 基准，正值表示对照场更晚）。对照为只读查询，不影响档案与当前演出。</p>
+    <div class="compare-selects">
+      <div>
+        <label class="field-label" for="compare-base">基准场次</label>
+        <select id="compare-base">${options}</select>
+      </div>
+      <div>
+        <label class="field-label" for="compare-other">对照场次</label>
+        <select id="compare-other">${options}</select>
+      </div>
+    </div>
+    <div class="actions">
+      <button data-action="archive-list">← 返回列表</button>
+      <button id="compare-submit" class="primary" data-action="compare-submit">开始对照 ⚖</button>
+    </div>
+    <div id="compare-result"></div>`;
+  if (items.length > 1) $("#compare-other").value = String(items[1].id);
+  // 切换场次：作废旧响应并清空旧结果，避免残留或被旧响应覆盖
+  $("#compare-base").addEventListener("change", invalidateCompare);
+  $("#compare-other").addEventListener("change", invalidateCompare);
+}
+
+function invalidateCompare() {
+  compareSeq++;
+  const box = $("#compare-result");
+  if (box) box.innerHTML = "";
+}
+
+async function submitCompare() {
+  const baseSel = $("#compare-base");
+  const otherSel = $("#compare-other");
+  if (!baseSel || !otherSel) return;
+  const seq = ++compareSeq;
+  const btn = $("#compare-submit");
+  if (btn) btn.disabled = true;
+  const box = $("#compare-result");
+  if (box) box.innerHTML = `<p class="empty">对照中…</p>`;
+  try {
+    const res = await fetch(
+      `/api/archives/compare?base=${encodeURIComponent(baseSel.value)}` +
+      `&other=${encodeURIComponent(otherSel.value)}`
+    );
+    const data = await res.json();
+    if (seq !== compareSeq) return; // 已切换场次或离开视图，丢弃旧响应
+    if (res.status === 404) {
+      box.innerHTML = `<p class="empty">档案不存在，可能已被删除，请返回列表刷新。</p>`;
+      return;
+    }
+    if (!res.ok) {
+      box.innerHTML = `<p class="empty">对照失败：${escapeHtml(data.error || ("HTTP " + res.status))}</p>`;
+      return;
+    }
+    renderCompareResult(data);
+  } catch (err) {
+    if (seq !== compareSeq) return;
+    if (box) box.innerHTML = `<p class="empty">网络错误：${escapeHtml(err.message)}</p>`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function renderCompareResult(data) {
+  const box = $("#compare-result");
+  if (!box) return;
+  const rows = data.rows || [];
+  const head = `
+    <div class="archive-detail-head">
+      <div class="archive-detail-name">
+        基准 #${data.base.id} ${escapeHtml(data.base.name)} ↔ 对照 #${data.other.id} ${escapeHtml(data.other.name)}
+      </div>
+      <div class="archive-detail-meta">各场以首条已发提示为零点 · 秒数含暂停时长 · 差值 = 对照 − 基准（正值表示对照场更晚）</div>
+    </div>`;
+  if (!rows.length) {
+    box.innerHTML = head + `<p class="empty">两场档案都没有提示，无可对照项。</p>`;
+    return;
+  }
+  const comparable = rows.filter((r) => r.diff_seconds !== null).length;
+  box.innerHTML = head + `
+    ${comparable === 0
+      ? `<p class="compare-empty">⚠ 两场没有可比较的提示：需<b>同一编号</b>在两侧均<b>已发出</b>且<b>内容完全一致</b>才能计算差值。</p>`
+      : `<p class="hint">可比较 ${comparable} / ${rows.length} 条（其余行见差值列原因）。</p>`}
+    <div class="compare-table-wrap">
+      <table class="compare-table">
+        <thead><tr><th>编号</th><th>基准场</th><th>对照场</th><th>差值（对照−基准）</th></tr></thead>
+        <tbody>
+          ${rows.map((r) => `
+            <tr>
+              <td><span class="badge">${escapeHtml(r.number)}</span></td>
+              <td>${compareSideCell(r.base)}</td>
+              <td>${compareSideCell(r.other)}</td>
+              <td>${r.diff_seconds !== null
+                ? `<span class="diff">${fmtDiff(r.diff_seconds)}</span>`
+                : `<span class="diff-reason">${escapeHtml(r.diff_reason || "")}</span>`}</td>
+            </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>`;
 }
 
 /* ---------------------------------------------------------------- 渲染 */
@@ -541,6 +694,10 @@ $("#archives-body").addEventListener("click", (e) => {
     loadArchiveDetail(Number(btn.dataset.id));
   } else if (action === "start-from-archive") {
     submitStartFromArchive();
+  } else if (action === "compare-view") {
+    openCompareView();
+  } else if (action === "compare-submit") {
+    submitCompare();
   }
 });
 

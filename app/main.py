@@ -291,6 +291,113 @@ def list_archives():
         return {"archives": [archive_summary(r) for r in rows]}
 
 
+# ---------------------------------------------------------------- 场次对照
+
+def _parse_iso(value) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compare_side(cues: list[dict], zero: Optional[datetime]) -> dict:
+    """编号 -> 该侧对照信息：状态 / 内容快照 / 发出时间 / 相对零点秒数。
+
+    秒数以该场首条已发提示的发出时间为零点，保留小数秒；暂停时长按墙钟
+    时间自然计入，不做补偿。未发或整场无已发记录（零点不存在）时为 None。
+    """
+    side = {}
+    for c in cues:
+        entry = {
+            "status": c["status"],
+            "content": c["content"],
+            "issued_at": c["issued_at"],
+            "seconds": None,
+        }
+        if c["status"] == "issued" and zero is not None:
+            t = _parse_iso(c["issued_at"])
+            if t is not None:
+                entry["seconds"] = round((t - zero).total_seconds(), 3)
+        side[c["number"]] = entry
+    return side
+
+
+@app.get("/api/archives/compare")
+def compare_archives(base: int, other: int):
+    """对照两场档案的提示发出节奏（只读，任意演出状态可用）。
+
+    按编号精确匹配，取两场提示的并集并按编号字符串升序排列；每条列出
+    两侧的内容快照、已发/未发/缺失状态与相对各自零点的发出秒数。仅当
+    两侧均已发出且内容完全相同时给出"对照减基准"的秒数差（正值表示
+    对照场更晚），其余为 null 并附中文原因。任一档案不存在返回 404；
+    不修改档案、当前演出或版本号。
+    """
+    with db() as conn:
+        rows = {}
+        for key, archive_id in (("base", base), ("other", other)):
+            row = conn.execute(
+                "SELECT * FROM archives WHERE id = ?", (archive_id,)
+            ).fetchone()
+            if row is None:
+                return JSONResponse(
+                    status_code=404, content={"error": "archive_not_found"}
+                )
+            rows[key] = row
+
+    sides = {}
+    metas = {}
+    for key, row in rows.items():
+        issued = json.loads(row["issued"])
+        pending = json.loads(row["pending"])
+        # 零点：该场首条已发提示的发出时间；整场无已发记录则没有零点
+        zero = _parse_iso(issued[0]["issued_at"]) if issued else None
+        cues = [
+            {**c, "status": "issued"} for c in issued
+        ] + [
+            {**c, "status": "pending", "issued_at": None} for c in pending
+        ]
+        sides[key] = _compare_side(cues, zero)
+        metas[key] = {
+            "id": row["id"],
+            "name": row["name"],
+            "archived_at": row["archived_at"],
+            "status": row["status"],
+        }
+
+    missing = {"status": "missing", "content": None, "issued_at": None, "seconds": None}
+    result_rows = []
+    for number in sorted(set(sides["base"]) | set(sides["other"])):
+        b = sides["base"].get(number)
+        o = sides["other"].get(number)
+        diff = None
+        reason = None
+        if b is None:
+            reason = "基准场无此编号"
+        elif o is None:
+            reason = "对照场无此编号"
+        elif b["status"] != "issued":
+            reason = "基准场未发出"
+        elif o["status"] != "issued":
+            reason = "对照场未发出"
+        elif b["content"] != o["content"]:
+            reason = "两侧内容不同"
+        elif b["seconds"] is None or o["seconds"] is None:
+            reason = "缺少发出时间"
+        else:
+            diff = round(o["seconds"] - b["seconds"], 3) or 0.0
+        result_rows.append(
+            {
+                "number": number,
+                "base": b if b is not None else missing,
+                "other": o if o is not None else missing,
+                "diff_seconds": diff,
+                "diff_reason": reason,
+            }
+        )
+
+    return {"base": metas["base"], "other": metas["other"], "rows": result_rows}
+
+
 @app.get("/api/archives/{archive_id}")
 def get_archive(archive_id: int):
     with db() as conn:
